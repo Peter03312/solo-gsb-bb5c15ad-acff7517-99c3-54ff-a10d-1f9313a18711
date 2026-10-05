@@ -243,4 +243,38 @@ function validateJobInput(body) {
   };
 }
 
-module.exports = { validateJobInput, LIMITS };
+/**
+ * 校验改版纸样提交（按型号）。返回 { errors: [string], value }。
+ * 只校验与现有方案状态无关的部分（轮廓合法性、件数正整数、布尔旋转）；
+ * 卷能否容纳、必用卷可行性等依赖方案状态的检查在路由中完成。
+ * body: { vertices, quantity, allowRotate? }
+ */
+function validateRevisionInput(body) {
+  const errors = [];
+  if (!body || typeof body !== 'object') {
+    return { errors: ['请求体为空或格式不正确'], value: null };
+  }
+  let norm = null;
+  const err = geom.validatePolygon(body.vertices);
+  if (err) {
+    errors.push(`新轮廓：${err}`);
+  } else {
+    norm = geom.normalize(body.vertices);
+  }
+  if (!isInt(body.quantity) || body.quantity < 1 || body.quantity > LIMITS.maxQuantityPerType) {
+    errors.push(`目标总件数必须为 1~${LIMITS.maxQuantityPerType} 的正整数`);
+  }
+  if (errors.length > 0) return { errors, value: null };
+  return {
+    errors,
+    value: {
+      vertices: norm.pts,
+      quantity: body.quantity,
+      allowRotate: body.allowRotate === true,
+      bw: norm.w,
+      bh: norm.h,
+    },
+  };
+}
+
+module.exports = { validateJobInput, validateRevisionInput, LIMITS };

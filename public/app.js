@@ -27,6 +27,15 @@ function typeColor(pieceTypeId) {
   return PALETTE[((idx % PALETTE.length) + PALETTE.length) % PALETTE.length];
 }
 
+/** 取某件裁片【实际使用版次】的纸样（已裁件可能定格在旧版，与型号当前版不同） */
+function revisionOf(p) {
+  const t = state.pieceTypes.find((tt) => tt.id === p.pieceTypeId);
+  if (!t) return null;
+  return (t.revisions || []).find((r) => r.id === p.pieceRevisionId) ||
+    (t.revisions || []).find((r) => r.rev === p.revision) ||
+    t; // 旧数据兜底
+}
+
 async function api(method, url, body) {
   const res = await fetch(url, {
     method,
@@ -115,6 +124,7 @@ function renderAll() {
   renderCutPanel();
   renderUnplaced();
   renderSelPanel();
+  renderRevPanel();
   setupCanvas();
   draw();
 }
@@ -290,8 +300,10 @@ function renderSelPanel() {
   panel.style.display = 'block';
   const roll = p.rollId ? state.rolls.find((r) => r.id === p.rollId) : null;
   const reqRoll = p.requiredRollId ? state.rolls.find((r) => r.id === p.requiredRollId) : null;
+  const t = state.pieceTypes.find((tt) => tt.id === p.pieceTypeId);
+  const rev = revisionOf(p);
   $('selInfo').innerHTML =
-    `<b>${p.name}#${p.seq}</b>　外接 ${p.bw}×${p.bh}mm　` +
+    `<b>${p.name}#${p.seq}</b>　外接 ${p.bw}×${p.bh}mm（纸样第${p.revision}版${p.revision !== t.currentRev ? '，型号当前为第' + t.currentRev + '版' : ''}）　` +
     (p.placed
       ? `卷「${roll.label}」卷内 (${p.x}, ${p.y}) ${p.rotation}°`
       : '<span style="color:#ef6c00">未排入</span>' + (p.reason ? `（${p.reason}）` : '')) +
@@ -315,8 +327,91 @@ function renderSelPanel() {
   });
 }
 
-/* ================= 画布 ================= */
+/* ================= 改版纸样 ================= */
 
+function renderRevPanel() {
+  const panel = $('revPanel');
+  if (!state) { panel.style.display = 'none'; return; }
+  panel.style.display = 'block';
+  const sel = $('revType');
+  const keep = sel.value;
+  sel.innerHTML = '';
+  for (const t of state.pieceTypes) {
+    const o = document.createElement('option');
+    o.value = t.id;
+    o.textContent = `${t.name}（当前第${t.currentRev}版，${t.quantity}件，${t.bw}×${t.bh}mm）`;
+    sel.appendChild(o);
+  }
+  if ([...sel.options].some((o) => o.value === keep)) sel.value = keep;
+  renderRevInfo();
+}
+
+function currentRevType() {
+  return state.pieceTypes.find((t) => t.id === Number($('revType').value));
+}
+
+function renderRevInfo() {
+  const t = currentRevType();
+  if (!t) { $('revInfo').textContent = ''; return; }
+  const ps = state.placements.filter((p) => p.pieceTypeId === t.id);
+  const cut = ps.filter((p) => p.cut).length;
+  const locked = ps.filter((p) => !p.cut && p.locked).length;
+  const placed = ps.filter((p) => !p.cut && p.placed).length;
+  const pool = ps.filter((p) => !p.cut && !p.placed).length;
+  const revs = [...new Set(ps.map((p) => p.revision))].sort((a, b) => a - b);
+  $('revInfo').innerHTML =
+    `共 ${ps.length} 件：已裁 ${cut}（保留旧版）、锁定 ${locked}、已排 ${placed}、未排 ${pool}。` +
+    `现存件版次：${revs.join('、') || '-'}。目标件数少于 ${cut + locked} 件会被拒绝。`;
+}
+
+$('revType').onchange = () => renderRevInfo();
+
+$('btnLoadCurrent').onclick = () => {
+  const t = currentRevType();
+  if (!t) return;
+  $('revVerts').value = t.vertices.map(([x, y]) => `${x},${y}`).join('\n');
+  $('revQty').value = t.quantity;
+  $('revRotate').checked = t.allowRotate;
+};
+
+$('btnRevise').onclick = async () => {
+  if (!state) return;
+  const t = currentRevType();
+  if (!t) return;
+  let vertices;
+  try {
+    vertices = parseVertices($('revVerts').value);
+  } catch (err) {
+    showMsg('新轮廓顶点解析失败：' + err.message, true);
+    return;
+  }
+  const quantity = Number($('revQty').value);
+  if (!window.confirm(
+    `确认对型号「${t.name}」提交改版纸样？\n` +
+    `目标总件数 ${quantity}；已裁件与裁剪清单不变，锁定件须在原位满足新轮廓，否则整次拒绝。`
+  )) return;
+  try {
+    const resp = await api('POST', `/api/jobs/${state.job.id}/piece-types/${t.id}/revisions`, {
+      vertices,
+      quantity,
+      allowRotate: $('revRotate').checked,
+    });
+    const rv = resp.revision;
+    state = resp;
+    delete state.revision;
+    showMsg(
+      `「${rv.name}」已更新到第 ${rv.revision} 版：删除 ${rv.deletedPieceIds.length} 件、` +
+      `新增 ${rv.addedCount} 件（未排区）、${rv.bouncedPieceIds.length} 件原位失效退回未排区、` +
+      `${rv.cutPieceIdsKept.length} 件已裁件保留旧轮廓。`,
+      rv.bouncedPieceIds.length > 0
+    );
+    renderAll();
+  } catch (err) {
+    showApiError(err, '改版被拒绝，原方案不变');
+  }
+};
+
+/* ================= 画布 ================= */
 function setupCanvas() {
   if (!state) {
     cv.width = 10;
@@ -413,7 +508,7 @@ function draw() {
     const isDrag = drag && drag.pid === p.id && drag.moved;
     const px = isDrag ? drag.curX : p.x;
     const py = isDrag ? drag.curY : p.y;
-    const t = state.pieceTypes.find((tt) => tt.id === p.pieceTypeId);
+    const t = revisionOf(p);
     const vs = t.vertices.map(([x, y]) =>
       p.rotation === 180 ? [px + t.bw - x, py + t.bh - y] : [px + x, py + y]
     );
@@ -434,7 +529,7 @@ function draw() {
       ctx.fillStyle = '#1a1a1a';
       ctx.font = '11px sans-serif';
       ctx.textAlign = 'center';
-      ctx.fillText(`${p.name}#${p.seq}${p.rotation === 180 ? ' ⟲180°' : ''}${p.cut ? ' ✂' : ''}`, mmX(cx), mmY(cy) + 4);
+      ctx.fillText(`${p.name}#${p.seq}${p.rotation === 180 ? ' ⟲180°' : ''}${p.cut ? ' ✂' : ''}${p.revision !== state.pieceTypes.find((tt) => tt.id === p.pieceTypeId).currentRev ? ' v' + p.revision : ''}`, mmX(cx), mmY(cy) + 4);
       ctx.textAlign = 'left';
     }
     if (p.locked && !p.cut) {
@@ -491,7 +586,7 @@ function pointInPoly(px, py, vs) {
 }
 
 function absVertsOf(p) {
-  const t = state.pieceTypes.find((tt) => tt.id === p.pieceTypeId);
+  const t = revisionOf(p);
   return t.vertices.map(([x, y]) =>
     p.rotation === 180 ? [p.x + t.bw - x, p.y + t.bh - y] : [p.x + x, p.y + y]
   );
@@ -504,7 +599,7 @@ cv.addEventListener('mousedown', (e) => {
   const placed = state.placements.filter((p) => p.placed && p.rollId === r.id);
   for (let i = placed.length - 1; i >= 0; i--) {
     const p = placed[i];
-    const t = state.pieceTypes.find((tt) => tt.id === p.pieceTypeId);
+    const t = revisionOf(p);
     if (mx < p.x || mx > p.x + t.bw || my < p.y || my > p.y + t.bh) continue;
     if (!pointInPoly(mx, my, absVertsOf(p))) continue;
     selectedId = p.id;

@@ -5,7 +5,7 @@ const express = require('express');
 const db = require('./db');
 const geom = require('./geom');
 const { optimizeRolls } = require('./nest');
-const { validateJobInput } = require('./validate');
+const { validateJobInput, validateRevisionInput, LIMITS } = require('./validate');
 
 const app = express();
 app.use(express.json({ limit: '2mb' }));
@@ -23,14 +23,21 @@ function loadFull(jobId) {
     .prepare('SELECT id, roll_id, x, y, w, h FROM defects WHERE job_id = ? ORDER BY id')
     .all(jobId);
   const types = db.prepare('SELECT * FROM piece_types WHERE job_id = ?').all(jobId);
+  const revisions = db
+    .prepare('SELECT * FROM piece_revisions WHERE job_id = ? ORDER BY piece_type_id, rev')
+    .all(jobId);
   const placements = db
     .prepare(
-      `SELECT p.*, t.name, t.allow_rotate, t.bw, t.bh
-       FROM placements p JOIN piece_types t ON t.id = p.piece_type_id
+      `SELECT p.*, t.name AS name,
+              rv.vertices AS rv_vertices, rv.allow_rotate AS rv_allow_rotate,
+              rv.bw AS rv_bw, rv.bh AS rv_bh, rv.rev AS rv_rev
+       FROM placements p
+       JOIN piece_types t ON t.id = p.piece_type_id
+       JOIN piece_revisions rv ON rv.id = p.piece_revision_id
        WHERE p.job_id = ? ORDER BY p.id`
     )
     .all(jobId);
-  return { job, rolls, defects, types, placements };
+  return { job, rolls, defects, types, revisions, placements };
 }
 
 /**
@@ -44,10 +51,10 @@ function recompute(jobId, touch) {
     .get(jobId);
   const rows = db
     .prepare(
-      `SELECT r.id, MAX(CASE WHEN p.placed = 1 THEN p.y + t.bh END) AS ml
+      `SELECT r.id, MAX(CASE WHEN p.placed = 1 THEN p.y + rv.bh END) AS ml
        FROM rolls r
        LEFT JOIN placements p ON p.roll_id = r.id
-       LEFT JOIN piece_types t ON t.id = p.piece_type_id
+       LEFT JOIN piece_revisions rv ON rv.id = p.piece_revision_id
        WHERE r.job_id = ?
        GROUP BY r.id
        ORDER BY r.seq`
@@ -72,7 +79,12 @@ function recompute(jobId, touch) {
 function jobState(jobId) {
   const full = loadFull(jobId);
   if (!full) return null;
-  const { job, rolls, defects, types, placements } = full;
+  const { job, rolls, defects, types, revisions, placements } = full;
+  const revsByType = new Map();
+  for (const rv of revisions) {
+    if (!revsByType.has(rv.piece_type_id)) revsByType.set(rv.piece_type_id, []);
+    revsByType.get(rv.piece_type_id).push(rv);
+  }
   const cutCountByRoll = new Map(rolls.map((r) => [r.id, 0]));
   for (const p of placements) {
     if (p.placed && p.cut) cutCountByRoll.set(p.roll_id, (cutCountByRoll.get(p.roll_id) || 0) + 1);
@@ -119,10 +131,23 @@ function jobState(jobId) {
       allowRotate: !!t.allow_rotate,
       bw: t.bw,
       bh: t.bh,
+      currentRev: t.current_rev,
+      // 全部历史版次（改版后已裁件可能定格在旧版）；最后一个即当前版
+      revisions: (revsByType.get(t.id) || []).map((rv) => ({
+        id: rv.id,
+        rev: rv.rev,
+        vertices: JSON.parse(rv.vertices),
+        allowRotate: !!rv.allow_rotate,
+        bw: rv.bw,
+        bh: rv.bh,
+        createdAt: rv.created_at,
+      })),
     })),
     placements: placements.map((p) => ({
       id: p.id,
       pieceTypeId: p.piece_type_id,
+      pieceRevisionId: p.piece_revision_id,
+      revision: p.rv_rev,               // 本件实际纸样版次（查询可分辨每件轮廓）
       rollId: p.roll_id,
       requiredRollId: p.required_roll_id,
       name: p.name,
@@ -133,9 +158,9 @@ function jobState(jobId) {
       placed: !!p.placed,
       locked: !!p.locked,
       cut: !!p.cut,
-      allowRotate: !!p.allow_rotate,
-      bw: p.bw,
-      bh: p.bh,
+      allowRotate: !!p.rv_allow_rotate, // 本件所用版次的旋转许可（已裁件随旧版定格）
+      bw: p.rv_bw,
+      bh: p.rv_bh,
       reason: p.unplaced_reason || null,
     })),
     unplaced: placements
@@ -212,17 +237,24 @@ app.post('/api/jobs', (req, res) => {
       for (const d of r.defects) insD.run(jobId, rollIds[i], d.x, d.y, d.w, d.h);
     });
     const insT = db.prepare(
-      'INSERT INTO piece_types (job_id, name, vertices, quantity, allow_rotate, bw, bh) VALUES (?, ?, ?, ?, ?, ?, ?)'
+      'INSERT INTO piece_types (job_id, name, vertices, quantity, allow_rotate, bw, bh, current_rev) VALUES (?, ?, ?, ?, ?, ?, ?, 1)'
+    );
+    const insRv = db.prepare(
+      'INSERT INTO piece_revisions (job_id, piece_type_id, rev, vertices, allow_rotate, bw, bh) VALUES (?, ?, 1, ?, ?, ?, ?)'
     );
     const insP = db.prepare(
-      'INSERT INTO placements (job_id, piece_type_id, seq, required_roll_id) VALUES (?, ?, ?, ?)'
+      'INSERT INTO placements (job_id, piece_type_id, piece_revision_id, seq, required_roll_id) VALUES (?, ?, ?, ?, ?)'
     );
     for (const p of value.pieces) {
       const t = insT.run(
         jobId, p.name, JSON.stringify(p.vertices), p.quantity, p.allowRotate ? 1 : 0, p.bw, p.bh
       );
+      const rv = insRv.run(
+        jobId, t.lastInsertRowid, JSON.stringify(p.vertices), p.allowRotate ? 1 : 0, p.bw, p.bh
+      );
+      const revId = rv.lastInsertRowid;
       const reqRollId = p.requiredRollIndex == null ? null : rollIds[p.requiredRollIndex];
-      for (let s = 1; s <= p.quantity; s++) insP.run(jobId, t.lastInsertRowid, s, reqRollId);
+      for (let s = 1; s <= p.quantity; s++) insP.run(jobId, t.lastInsertRowid, revId, s, reqRollId);
     }
     return jobId;
   });
@@ -253,7 +285,6 @@ app.post('/api/jobs/:id/optimize', (req, res) => {
   if (!full) return res.status(404).json({ error: '方案不存在' });
   const { job, rolls, defects, types, placements } = full;
   const rollIndexById = new Map(rolls.map((r, i) => [r.id, i]));
-  const typeById = new Map(types.map((t) => [t.id, t]));
 
   // 已裁件与锁定件一样固定不动（已裁件同时位于已裁段障碍带内）
   const locked = placements.filter((p) => p.placed && (p.locked || p.cut));
@@ -270,29 +301,26 @@ app.post('/api/jobs/:id/optimize', (req, res) => {
         ...defects.filter((d) => d.roll_id === r.id),
       ],
     })),
-    locked: locked.map((p) => {
-      const t = typeById.get(p.piece_type_id);
-      return {
-        key: p.id,
-        rollIndex: rollIndexById.get(p.roll_id),
-        verts: JSON.parse(t.vertices),
-        rot: p.rotation,
-        x: p.x,
-        y: p.y,
-        w: t.bw,
-        h: t.bh,
-      };
-    }),
+    locked: locked.map((p) => ({
+      key: p.id,
+      rollIndex: rollIndexById.get(p.roll_id),
+      verts: JSON.parse(p.rv_vertices),
+      rot: p.rotation,
+      x: p.x,
+      y: p.y,
+      w: p.rv_bw,
+      h: p.rv_bh,
+    })),
     pieces: rest.map((p) => {
-      const t = typeById.get(p.piece_type_id);
-      const verts = JSON.parse(t.vertices);
+      const verts = JSON.parse(p.rv_vertices);
       return {
         key: p.id,
-        maskKey: 'T' + t.id,
+        // 同型号改版后，未裁件可能共用新版掩码；已裁旧版件不会进入这里
+        maskKey: 'R' + p.piece_revision_id,
         verts,
-        allowRotate: !!t.allow_rotate,
-        w: t.bw,
-        h: t.bh,
+        allowRotate: !!p.rv_allow_rotate,
+        w: p.rv_bw,
+        h: p.rv_bh,
         area: Math.abs(geom.area2(verts)) / 2,
         requiredIndex: p.required_roll_id == null ? null : rollIndexById.get(p.required_roll_id),
       };
@@ -352,7 +380,7 @@ app.post('/api/jobs/:id/placements/:pid/move', (req, res) => {
   const pid = Number(req.params.pid);
   const full = loadFull(jobId);
   if (!full) return res.status(404).json({ error: '方案不存在' });
-  const { job, rolls, defects, types, placements } = full;
+  const { job, rolls, defects, placements } = full;
   const rollById = new Map(rolls.map((r) => [r.id, r]));
   const placement = placements.find((p) => p.id === pid);
   if (!placement) return res.status(404).json({ error: '裁片不存在' });
@@ -414,11 +442,11 @@ app.post('/api/jobs/:id/placements/:pid/move', (req, res) => {
   if (rotation !== 0 && rotation !== 180) {
     return res.status(400).json({ error: '旋转角度仅支持 0° 或 180°' });
   }
-  if (rotation === 180 && !placement.allow_rotate) {
-    return res.status(409).json({ error: `${label}不允许旋转（禁旋转件须保持原方向）`, conflicts: [label] });
+  if (rotation === 180 && !placement.rv_allow_rotate) {
+    return res.status(409).json({ error: `${label}不允许旋转（该版纸样禁旋转，须保持原方向）`, conflicts: [label] });
   }
-  const w = placement.bw;
-  const h = placement.bh;
+  const w = placement.rv_bw;
+  const h = placement.rv_bh;
   if (x < 0 || y < 0 || x + w > targetRoll.width || y + h > targetRoll.length) {
     return res.status(409).json({
       error:
@@ -438,8 +466,7 @@ app.post('/api/jobs/:id/placements/:pid/move', (req, res) => {
     });
   }
 
-  const type = types.find((t) => t.id === placement.piece_type_id);
-  const verts = JSON.parse(type.vertices);
+  const verts = JSON.parse(placement.rv_vertices);
   const abs = geom.toAbsolute(verts, rotation, w, h, x, y);
 
   const conflicts = [];
@@ -450,8 +477,7 @@ app.post('/api/jobs/:id/placements/:pid/move', (req, res) => {
   }
   for (const q of placements) {
     if (q.id === pid || !q.placed || q.roll_id !== targetRoll.id) continue;
-    const qt = types.find((t) => t.id === q.piece_type_id);
-    const qAbs = geom.toAbsolute(JSON.parse(qt.vertices), q.rotation, qt.bw, qt.bh, q.x, q.y);
+    const qAbs = geom.toAbsolute(JSON.parse(q.rv_vertices), q.rotation, q.rv_bw, q.rv_bh, q.x, q.y);
     if (geom.polygonsInteriorOverlap(abs, qAbs)) {
       const tag = q.cut ? '（已裁）' : q.locked ? '（已锁定）' : '';
       conflicts.push(`卷「${targetRoll.label}」裁片「${q.name}#${q.seq}」${tag}`);
@@ -526,7 +552,7 @@ app.post('/api/jobs/:id/placements/:pid/require-roll', (req, res) => {
   const pid = Number(req.params.pid);
   const full = loadFull(jobId);
   if (!full) return res.status(404).json({ error: '方案不存在' });
-  const { rolls, types, placements } = full;
+  const { rolls, placements } = full;
   const rollById = new Map(rolls.map((r) => [r.id, r]));
   const placement = placements.find((p) => p.id === pid);
   if (!placement) return res.status(404).json({ error: '裁片不存在' });
@@ -553,19 +579,19 @@ app.post('/api/jobs/:id/placements/:pid/require-roll', (req, res) => {
           .join('、')}）`,
       });
     }
-    if (placement.bw > target.width || placement.bh > target.length) {
+    if (placement.rv_bw > target.width || placement.rv_bh > target.length) {
       return res.status(400).json({
         error:
-          `${label}外接尺寸 ${placement.bw}×${placement.bh}mm 超过必用卷「${target.label}」` +
+          `${label}外接尺寸 ${placement.rv_bw}×${placement.rv_bh}mm 超过必用卷「${target.label}」` +
           `（${target.width}×${target.length}mm），必用卷约束不可能满足，已拒绝`,
       });
     }
     // 该卷已有切线时，未裁件只能使用切线之后的剩余段
     const remain = target.length - (target.cut_line || 0);
-    if (placement.bh > remain) {
+    if (placement.rv_bh > remain) {
       return res.status(400).json({
         error:
-          `${label}外接长度 ${placement.bh}mm 超过必用卷「${target.label}」切线后剩余长度` +
+          `${label}外接长度 ${placement.rv_bh}mm 超过必用卷「${target.label}」切线后剩余长度` +
           `（切线 ${target.cut_line}mm，剩余 ${remain}mm），必用卷约束不可能满足，已拒绝`,
       });
     }
@@ -578,6 +604,263 @@ app.post('/api/jobs/:id/placements/:pid/require-roll', (req, res) => {
     jobId
   );
   res.json(jobState(jobId));
+});
+
+// ---------- 改版纸样（按裁片型号修订） ----------
+
+/**
+ * 提交某型号的改版纸样：
+ *   POST /api/jobs/:id/piece-types/:tid/revisions
+ *   body: { vertices: [[x,y],...], quantity: 正整数, allowRotate?: bool }
+ *
+ * 语义（全部在单个事务内完成；任一校验不通过 → 400/409 且原方案完全不变）：
+ *  - 后续再次修订仍针对该型号“当前纸样”；历史版次保留。
+ *  - 已裁件（含锁定的已裁件）继续使用各自裁剪时定格的旧轮廓，卷号/坐标/方向/必用卷/裁剪清单不变；
+ *  - 其余同型号未裁件改用新轮廓（新外接尺寸、新旋转许可），原必用卷约束不变；
+ *  - 缩减（quantity 减少）：先删未排件，再按 placement id 降序删未锁定已排件；绝不删已裁或锁定件；
+ *  - 扩增：新增件进入未排区（seq 接该型号最大号之后），无必用卷；
+ *  - 锁定的未裁件必须在“原位”满足新轮廓/旋转许可/布边/切线后区域/瑕疵，且与其他保留件不重叠，
+ *    否则【整次拒绝】；
+ *  - 未锁定已排件按 id 升序在“原位”校验，失效者退回未排区并在 reason 注明原因；
+ *  - 前置可行性：只要还有未裁件，至少一卷的切线后剩余段必须容得下新外接尺寸；各必用卷也须容得下。
+ * 成功后：同步各卷占用长度与方案状态，查询结果可按每件 revision 分辨其轮廓版本。
+ */
+app.post('/api/jobs/:id/piece-types/:tid/revisions', (req, res) => {
+  const jobId = Number(req.params.id);
+  const typeId = Number(req.params.tid);
+  const full = loadFull(jobId);
+  if (!full) return res.status(404).json({ error: '方案不存在' });
+  const { rolls, defects, types, placements } = full;
+  const type = types.find((t) => t.id === typeId);
+  if (!type) return res.status(404).json({ error: '裁片型号不存在' });
+
+  // ---- 输入本身（轮廓合法、件数正整数） ----
+  const { errors, value } = validateRevisionInput(req.body);
+  if (errors.length > 0) {
+    return res.status(400).json({ error: '改版输入不合法，已保留原方案', details: errors });
+  }
+  const { vertices: newVerts, quantity: newQty, allowRotate: newAllow, bw: newW, bh: newH } = value;
+
+  const ofType = placements.filter((p) => p.piece_type_id === typeId);
+  const cutPieces = ofType.filter((p) => p.cut);          // 已裁（旧轮廓定格，永不动）
+  const lockedSurvivors = ofType.filter((p) => !p.cut && p.locked);
+  const protectedCount = cutPieces.length + lockedSurvivors.length;
+  if (newQty < protectedCount) {
+    return res.status(400).json({
+      error:
+        `目标总件数 ${newQty} 小于该型号不可删除件数 ${protectedCount}` +
+        `（已裁 ${cutPieces.length} 件、未裁锁定 ${lockedSurvivors.length} 件均不可删除），已保留原方案`,
+    });
+  }
+
+  // 裁片总数上限（缩减只减不增，故仅扩增时可能超限）
+  if (newQty > ofType.length) {
+    const projectedTotal = placements.length - ofType.length + newQty;
+    if (projectedTotal > LIMITS.maxTotalPieces) {
+      return res.status(400).json({
+        error: `改版后裁片总件数 ${projectedTotal} 超出系统上限（${LIMITS.maxTotalPieces} 件），已保留原方案`,
+      });
+    }
+  }
+
+  // ---- 缩减：确定将被删除的件（未排优先；再 id 降序的未锁定已排；已裁/锁定绝不删） ----
+  let toDelete = [];
+  if (newQty < ofType.length) {
+    const need = ofType.length - newQty;
+    const removableUnplaced = ofType
+      .filter((p) => !p.cut && !p.locked && !p.placed)
+      .sort((a, b) => b.id - a.id); // 同阶段内也按 id 降序，行为确定
+    const removablePlaced = ofType
+      .filter((p) => !p.cut && !p.locked && p.placed)
+      .sort((a, b) => b.id - a.id); // id 降序
+    toDelete = [...removableUnplaced, ...removablePlaced].slice(0, need);
+    if (toDelete.length < need) {
+      // 理论上被前面的 protectedCount 校验挡住，这里兜底
+      return res.status(400).json({
+        error: `可删除件不足（已裁件与锁定件不可删除），无法缩减到 ${newQty} 件，已保留原方案`,
+      });
+    }
+  }
+  const deletedIds = new Set(toDelete.map((p) => p.id));
+  const survivors = ofType.filter((p) => !deletedIds.has(p.id));
+  const uncutSurvivors = survivors.filter((p) => !p.cut);
+  const addCount = Math.max(0, newQty - ofType.length);
+
+  // ---- 几何辅助：一件在其当前卷/坐标/方向上的绝对多边形（同型号未裁件改用新轮廓） ----
+  const rollById = new Map(rolls.map((r) => [r.id, r]));
+  const absOf = (p, verts, w, h) => geom.toAbsolute(verts, p.rotation, w, h, p.x, p.y);
+  const effOf = (p) =>
+    p.piece_type_id === typeId && !p.cut
+      ? { verts: newVerts, w: newW, h: newH, allowRotate: newAllow }
+      : { verts: JSON.parse(p.rv_vertices), w: p.rv_bw, h: p.rv_bh, allowRotate: !!p.rv_allow_rotate };
+  const labelOf = (p) => `裁片「${p.name}#${p.seq}」`;
+
+  /**
+   * 检查某绝对多边形在某卷与“仍保留的已排件/瑕疵”的内部重叠；返回冲突描述数组（空=通过）。
+   * ignoreIds 中的件不参与（典型：被校验件自身、已确定退回未排区的件）；已确定删除的件始终忽略。
+   * 布边/切线/旋转许可是逐件的一维判定，在调用处给出更准确的信息。
+   */
+  function conflictsOnRoll(p, abs, roll, ignoreIds) {
+    const out = [];
+    for (const d of defects.filter((d) => d.roll_id === roll.id)) {
+      if (geom.polygonsInteriorOverlap(abs, geom.rectPoly(d.x, d.y, d.w, d.h))) {
+        out.push(`卷「${roll.label}」瑕疵区#${d.id}（${d.x},${d.y} ${d.w}×${d.h}mm）`);
+      }
+    }
+    for (const q of placements) {
+      if (!q.placed || q.roll_id !== roll.id || q.id === p.id) continue;
+      if (ignoreIds.has(q.id) || deletedIds.has(q.id)) continue;
+      const e = effOf(q);
+      const qAbs = geom.toAbsolute(e.verts, q.rotation, e.w, e.h, q.x, q.y);
+      if (geom.polygonsInteriorOverlap(abs, qAbs)) {
+        const tag = q.cut ? '（已裁）' : q.locked ? '（已锁定）' : '';
+        out.push(`卷「${roll.label}」${labelOf(q)}${tag}`);
+      }
+    }
+    return out;
+  }
+
+  // ---- 前置可行性：有未裁件时至少一卷剩余段容得下；各必用卷也须容得下 ----
+  if (uncutSurvivors.length > 0) {
+    const anyRollFits = rolls.some((r) => newW <= r.width && newH <= r.length - (r.cut_line || 0));
+    if (!anyRollFits) {
+      return res.status(400).json({
+        error:
+          `改版后新外接尺寸 ${newW}×${newH}mm 无法放入任何一卷的切线后剩余段` +
+          `（至少需要一卷剩余段容纳该尺寸），已保留原方案`,
+        details: rolls.map((r) => `卷「${r.label}」${r.width}×${r.length - (r.cut_line || 0)}mm（切线 ${r.cut_line || 0}mm 后）`),
+      });
+    }
+    // 各必用卷：同型号未裁件若有必用卷约束，该卷剩余段必须容得下
+    const reqRollIds = [...new Set(uncutSurvivors.map((p) => p.required_roll_id).filter((v) => v != null))];
+    for (const rid of reqRollIds) {
+      const r = rollById.get(rid);
+      if (!r || newW > r.width || newH > r.length - (r.cut_line || 0)) {
+        return res.status(400).json({
+          error:
+            `改版后新外接尺寸 ${newW}×${newH}mm 超过必用卷「${r ? r.label : rid}」切线后剩余段` +
+            `（${r ? r.width + '×' + (r.length - (r.cut_line || 0)) : '卷不存在'}mm），必用卷约束不可能满足，已保留原方案`,
+        });
+      }
+    }
+  }
+
+  // ---- 锁定的未裁同型号件：必须在原位满足新纸样，否则整次拒绝 ----
+  // 不可移动的参照：布边/切线、瑕疵、已裁件、全部锁定件（含本型号其他锁定件，后者用新轮廓）。
+  // 未锁定件不在此阶段判定：若它挡住锁定件，稍后的原位校验会把它退回未排区。
+  const lockFailures = [];
+  for (const p of lockedSurvivors) {
+    const roll = rollById.get(p.roll_id);
+    const probs = [];
+    if (p.rotation === 180 && !newAllow) probs.push('新纸样不允许旋转 180°，该件锁定在 180° 方向');
+    if (p.x < 0 || p.y < 0 || p.x + newW > roll.width || p.y + newH > roll.length) {
+      probs.push(
+        `新外接尺寸 ${newW}×${newH}mm 超出卷「${roll.label}」布边` +
+        `（原位 (${p.x},${p.y})，该卷 ${roll.width}×${roll.length}mm）`
+      );
+    }
+    if (p.y < (roll.cut_line || 0)) {
+      probs.push(`原位位于卷「${roll.label}」切线 ${roll.cut_line}mm 之前的已裁段（未裁件须 y≥${roll.cut_line}）`);
+    }
+    const abs = absOf(p, newVerts, newW, newH);
+    // 忽略全部未锁定已排件（它们随后按 id 升序逐个定夺）；自身与将删件在函数内已忽略
+    const movableIds = new Set(
+      placements.filter((q) => q.placed && !q.cut && !q.locked).map((q) => q.id)
+    );
+    for (const c of conflictsOnRoll(p, abs, roll, movableIds)) probs.push('与 ' + c + ' 冲突');
+    if (probs.length > 0) lockFailures.push({ p, probs });
+  }
+  if (lockFailures.length > 0) {
+    return res.status(409).json({
+      error:
+        `改版后 ${lockFailures.length} 件锁定裁片无法在原位满足新纸样（锁定件须原位合法，否则整次拒绝），已保留原方案`,
+      conflicts: lockFailures.flatMap(({ p, probs }) =>
+        probs.map((s) => `${labelOf(p)}：${s}`)
+      ),
+    });
+  }
+
+  // ---- 未锁定已排件：按 id 升序在原位校验，失效者退回未排区 ----
+  // 参照障碍：瑕疵、已裁件、全部锁定件（锁定阶段已确认合法），以及本阶段先于它通过校验的件。
+  // 同型号件换用新轮廓，其他型号件轮廓不变；改版后同型号件的变化可能使其他型号件原位失效，
+  // 故所有未锁定已排件【不分型号】统一按 placement id 升序逐个定夺。
+  const bounce = []; // { p, reason }
+  const bouncedIds = new Set();
+  const unlockedPlaced = placements
+    .filter((p) => !p.cut && !p.locked && p.placed && !deletedIds.has(p.id))
+    .sort((a, b) => a.id - b.id); // id 升序（含本型号与其他型号）
+  for (const p of unlockedPlaced) {
+    const roll = rollById.get(p.roll_id);
+    const e = effOf(p);
+    const probs = [];
+    if (p.rotation === 180 && !e.allowRotate) probs.push('该版纸样不允许旋转 180°');
+    if (p.x < 0 || p.y < 0 || p.x + e.w > roll.width || p.y + e.h > roll.length) {
+      probs.push(`超出卷「${roll.label}」布边`);
+    }
+    if (p.y < (roll.cut_line || 0)) probs.push(`位于卷「${roll.label}」已裁段（切线 ${roll.cut_line}mm）`);
+    const abs = absOf(p, e.verts, e.w, e.h);
+    // 此前已退回未排区的件不再占空间；已通过的件（锁定件+先通过的未锁定件）正常参与冲突判定
+    for (const c of conflictsOnRoll(p, abs, roll, bouncedIds)) probs.push('与 ' + c + ' 冲突');
+    if (probs.length > 0) {
+      bouncedIds.add(p.id);
+      bounce.push({ p, reason: `纸样改版（第 ${type.current_rev + 1} 版）后原位失效：${probs.join('；')}` });
+    }
+  }
+
+  // ---- 全部前置检查通过，执行修订 ----
+  const tx = db.transaction(() => {
+    // 删除缩减件（先删 placement；CASCADE 不涉及 revision，因历史版仍被已裁件引用）
+    const delP = db.prepare('DELETE FROM placements WHERE id = ?');
+    for (const p of toDelete) delP.run(p.id);
+
+    // 写入新版纸样
+    const newRev = type.current_rev + 1;
+    const rvInfo = db
+      .prepare(
+        'INSERT INTO piece_revisions (job_id, piece_type_id, rev, vertices, allow_rotate, bw, bh) VALUES (?, ?, ?, ?, ?, ?, ?)'
+      )
+      .run(jobId, typeId, newRev, JSON.stringify(newVerts), newAllow ? 1 : 0, newW, newH);
+    const newRevId = rvInfo.lastInsertRowid;
+
+    // 型号镜像为当前版；未裁同型号件逐件改挂新版（已裁件保留旧版）
+    db.prepare(
+      'UPDATE piece_types SET vertices = ?, quantity = ?, allow_rotate = ?, bw = ?, bh = ?, current_rev = ? WHERE id = ?'
+    ).run(JSON.stringify(newVerts), newQty, newAllow ? 1 : 0, newW, newH, newRev, typeId);
+    const linkNew = db.prepare('UPDATE placements SET piece_revision_id = ? WHERE id = ?');
+    for (const p of uncutSurvivors) linkNew.run(newRevId, p.id);
+
+    // 失效的未锁定已排件退回未排区（解锁保留？规格只说退回未排区；锁定状态对未排件无意义，清零）
+    const backToPool = db.prepare(
+      'UPDATE placements SET x = NULL, y = NULL, rotation = 0, placed = 0, locked = 0, unplaced_reason = ? WHERE id = ?'
+    );
+    for (const { p, reason } of bounce) backToPool.run(reason, p.id);
+
+    // 扩增件：进入未排区，无必用卷，seq 接最大号之后
+    const maxSeq = db
+      .prepare('SELECT COALESCE(MAX(seq), 0) AS m FROM placements WHERE piece_type_id = ?')
+      .get(typeId).m;
+    const insP = db.prepare(
+      'INSERT INTO placements (job_id, piece_type_id, piece_revision_id, seq, required_roll_id) VALUES (?, ?, ?, ?, NULL)'
+    );
+    for (let k = 0; k < addCount; k++) insP.run(jobId, typeId, newRevId, maxSeq + k + 1);
+
+    recompute(jobId, true); // 修订视为方案已进入工作流，未排齐时为部分方案
+  });
+  tx();
+
+  const state = jobState(jobId);
+  state.revision = {
+    pieceTypeId: typeId,
+    name: type.name,
+    revision: type.current_rev + 1,
+    targetQuantity: newQty,
+    previousQuantity: ofType.length,
+    deletedPieceIds: toDelete.map((p) => p.id),
+    addedCount: addCount,
+    bouncedPieceIds: bounce.map((b) => b.p.id),
+    cutPieceIdsKept: cutPieces.map((p) => p.id),
+  };
+  res.json(state);
 });
 
 // ---------- 裁剪进度（按卷逐段，不可回退） ----------
@@ -603,7 +886,7 @@ app.post('/api/jobs/:id/cuts', (req, res) => {
   const jobId = Number(req.params.id);
   const full = loadFull(jobId);
   if (!full) return res.status(404).json({ error: '方案不存在' });
-  const { rolls, types, placements } = full;
+  const { rolls, placements } = full;
   const rollById = new Map(rolls.map((r) => [r.id, r]));
 
   // ---- 目标卷解析（与 move 相同的省略规则） ----
@@ -657,7 +940,7 @@ app.post('/api/jobs/:id/cuts', (req, res) => {
     if (p.cut) continue; // 已裁件必然位于旧切线之前，跳过
     // 归一化轮廓的外接矩形即 [0,bw]×[0,bh]；未裁件整体位于切线之后 ⇔ y ≥ cutLine（边接触允许）
     if (p.y < cutLine) {
-      if (p.y + p.bh <= cutLine) {
+      if (p.y + p.rv_bh <= cutLine) {
         newlyCut.push(p); // 整件在切线之前，随本段裁下
       } else {
         straddlers.push(p); // 穿过切线：y < cutLine < y+bh
@@ -670,7 +953,7 @@ app.post('/api/jobs/:id/cuts', (req, res) => {
       error:
         `切线 ${cutLine}mm 穿过卷「${roll.label}」上 ${straddlers.length} 件未裁裁片` +
         `（裁片须整体位于切线之前或之后，边接触允许），已保留原方案`,
-      conflicts: straddlers.map((p) => `裁片「${p.name}#${p.seq}」（y ${p.y}~${p.y + p.bh}mm）`),
+      conflicts: straddlers.map((p) => `裁片「${p.name}#${p.seq}」（y ${p.y}~${p.y + p.rv_bh}mm）`),
     });
   }
   if (newlyCut.length === 0) {

@@ -71,6 +71,28 @@
         </div>
         <p class="hint">提示：也可直接在画布上拖动裁片（跨卷请先在上方选目标卷再应用位置；锁定件需先解锁）。已裁件（✂）的卷号、位置、方向与必用卷均不可再改。</p>
       </section>
+
+      <section class="panel" id="revPanel" style="display:none">
+        <h2>改版纸样（按型号）</h2>
+        <div class="row">
+          <label>裁片型号</label>
+          <select id="revType"></select>
+        </div>
+        <div id="revInfo" class="hint"></div>
+        <textarea id="revVerts" placeholder="新轮廓顶点，每行一个：x,y（整数mm）&#10;0,0&#10;600,0&#10;600,900&#10;0,900"></textarea>
+        <div class="row">
+          <label>目标总件数</label>
+          <input id="revQty" type="number" min="1" step="1">
+        </div>
+        <div class="row">
+          <label><input id="revRotate" type="checkbox"> 允许旋转 180°</label>
+        </div>
+        <div class="row btns">
+          <button id="btnLoadCurrent">读入当前轮廓</button>
+          <button id="btnRevise" class="primary">提交改版</button>
+        </div>
+        <p class="hint">已裁件继续使用旧轮廓、卷号坐标与裁剪清单均不变；其余同型号件改用新轮廓。缩减先删未排件、再按 ID 降序删未锁定已排件，已裁/锁定件不删；扩增件进入未排区。锁定件须在原位满足新轮廓，否则整次拒绝。</p>
+      </section>
     </aside>
 
     <section id="workspace">

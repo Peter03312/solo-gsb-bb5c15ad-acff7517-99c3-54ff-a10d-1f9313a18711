@@ -45,10 +45,22 @@ CREATE TABLE IF NOT EXISTS piece_types (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   job_id       INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
   name         TEXT NOT NULL,
-  vertices     TEXT NOT NULL,              -- JSON，归一化后的顶点 [[x,y],...]
+  vertices     TEXT NOT NULL,              -- JSON，【当前版】归一化顶点 [[x,y],...]（历史版见 piece_revisions）
   quantity     INTEGER NOT NULL,
-  allow_rotate INTEGER NOT NULL DEFAULT 0, -- 是否允许旋转 180°
-  bw INTEGER NOT NULL, bh INTEGER NOT NULL  -- 外接矩形尺寸（旋转 180° 不变）
+  allow_rotate INTEGER NOT NULL DEFAULT 0, -- 【当前版】是否允许旋转 180°
+  bw INTEGER NOT NULL, bh INTEGER NOT NULL, -- 【当前版】外接矩形尺寸
+  current_rev  INTEGER NOT NULL DEFAULT 1  -- 当前版次（最新 revision 的 rev）
+);
+
+CREATE TABLE IF NOT EXISTS piece_revisions (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id         INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+  piece_type_id  INTEGER NOT NULL REFERENCES piece_types(id) ON DELETE CASCADE,
+  rev            INTEGER NOT NULL,          -- 版次（该型号从 1 起，单调递增）
+  vertices       TEXT NOT NULL,             -- 该版归一化顶点 [[x,y],...]
+  allow_rotate   INTEGER NOT NULL,          -- 该版是否允许旋转 180°
+  bw INTEGER NOT NULL, bh INTEGER NOT NULL, -- 该版外接矩形尺寸
+  created_at     TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS placements (
@@ -57,7 +69,8 @@ CREATE TABLE IF NOT EXISTS placements (
   piece_type_id    INTEGER NOT NULL REFERENCES piece_types(id) ON DELETE CASCADE,
   roll_id          INTEGER REFERENCES rolls(id) ON DELETE CASCADE, -- 所在卷（未排入为 NULL）
   required_roll_id INTEGER REFERENCES rolls(id) ON DELETE SET NULL, -- 必用卷约束（NULL=不限）
-  seq              INTEGER NOT NULL,       -- 该型号的第几件（1..quantity）
+  piece_revision_id INTEGER REFERENCES piece_revisions(id) ON DELETE CASCADE, -- 本件实际使用的纸样版本（已裁件定格在裁剪时的旧版）
+  seq              INTEGER NOT NULL,       -- 该型号的第几件（1..；缩减后可能留空号，扩增件接最大号之后）
   x INTEGER, y INTEGER,                    -- 卷内放置位置（未排入为 NULL）
   rotation INTEGER NOT NULL DEFAULT 0,     -- 0 | 180
   placed   INTEGER NOT NULL DEFAULT 0,
@@ -74,6 +87,7 @@ CREATE INDEX IF NOT EXISTS idx_rolls_job       ON rolls(job_id);
 CREATE INDEX IF NOT EXISTS idx_defects_job     ON defects(job_id);
 CREATE INDEX IF NOT EXISTS idx_defects_roll    ON defects(roll_id);
 CREATE INDEX IF NOT EXISTS idx_types_job       ON piece_types(job_id);
+CREATE INDEX IF NOT EXISTS idx_revs_type       ON piece_revisions(piece_type_id);
 CREATE INDEX IF NOT EXISTS idx_placements_job  ON placements(job_id);
 CREATE INDEX IF NOT EXISTS idx_placements_roll ON placements(roll_id);
 `);
@@ -103,6 +117,26 @@ if (!hasColumn('placements', 'cut')) {
 if (!hasColumn('rolls', 'cut_line')) {
   db.exec('ALTER TABLE rolls ADD COLUMN cut_line INTEGER NOT NULL DEFAULT 0');
 }
+if (!hasColumn('piece_types', 'current_rev')) {
+  db.exec('ALTER TABLE piece_types ADD COLUMN current_rev INTEGER NOT NULL DEFAULT 1');
+}
+if (!hasColumn('placements', 'piece_revision_id')) {
+  db.exec('ALTER TABLE placements ADD COLUMN piece_revision_id INTEGER');
+}
+
+// 旧库迁移：为每个已有型号补一条“第 1 版”纸样，并把全部已存在件挂到该版
+db.transaction(() => {
+  const types = db.prepare('SELECT id, vertices, allow_rotate, bw, bh FROM piece_types').all();
+  const insRev = db.prepare(
+    'INSERT INTO piece_revisions (job_id, piece_type_id, rev, vertices, allow_rotate, bw, bh) VALUES (?, ?, 1, ?, ?, ?, ?)'
+  );
+  const link = db.prepare('UPDATE placements SET piece_revision_id = ? WHERE piece_type_id = ? AND piece_revision_id IS NULL');
+  for (const t of types) {
+    const jobId = db.prepare('SELECT job_id FROM piece_types WHERE id = ?').get(t.id).job_id;
+    const info = insRev.run(jobId, t.id, t.vertices, t.allow_rotate, t.bw, t.bh);
+    link.run(info.lastInsertRowid, t.id);
+  }
+})();
 
 // 旧单卷方案：为每个无卷记录的方案补一卷「默认卷」，并把瑕疵与裁片挂到该卷
 db.transaction(() => {

@@ -929,6 +929,259 @@ test('API：裁剪进度在 GET 详情与旧字段中同时可用且不破坏原
   })
 );
 
+// ---------------- 改版纸样（按型号修订） ----------------
+
+console.log('改版纸样 API');
+
+test('API：改版——新轮廓非法/件数非正整数 400 且方案不变', () =>
+  withServer(async (call) => {
+    const cr = await call('POST', '/api/jobs', {
+      rolls: [{ label: 'A', width: 1000, length: 5000 }],
+      pieces: [{ name: '块', vertices: rect(0, 0, 400, 400), quantity: 2 }],
+    });
+    const jobId = cr.data.job.id;
+    const tid = cr.data.pieceTypes[0].id;
+    let r = await call('POST', `/api/jobs/${jobId}/piece-types/${tid}/revisions`, {
+      vertices: [[0, 0], [10, 10], [10, 0], [0, 10]], quantity: 2, // 自交
+    });
+    assert.strictEqual(r.status, 400);
+    assert(/自相交/.test(r.data.details.join()));
+    r = await call('POST', `/api/jobs/${jobId}/piece-types/${tid}/revisions`, {
+      vertices: rect(0, 0, 300, 300), quantity: 0,
+    });
+    assert.strictEqual(r.status, 400);
+    assert(/正整数/.test(r.data.details.join()));
+    // 不存在型号 404
+    r = await call('POST', `/api/jobs/${jobId}/piece-types/99999/revisions`, {
+      vertices: rect(0, 0, 300, 300), quantity: 1,
+    });
+    assert.strictEqual(r.status, 404);
+    // 原方案仍为第 1 版
+    const q = await call('GET', `/api/jobs/${jobId}`);
+    assert.strictEqual(q.data.pieceTypes[0].currentRev, 1);
+    assert(q.data.placements.every((p) => p.revision === 1 && p.bw === 400));
+  })
+);
+
+test('API：改版——已裁件定格旧轮廓旧位置，未裁件用新轮廓并按 id 升序退回失效件', () =>
+  withServer(async (call) => {
+    const cr = await call('POST', '/api/jobs', {
+      rolls: [{ label: 'A', width: 1000, length: 5000 }],
+      pieces: [{ name: '块', vertices: rect(0, 0, 400, 400), quantity: 4 }],
+    });
+    const jobId = cr.data.job.id;
+    const tid = cr.data.pieceTypes[0].id;
+    const rid = cr.data.rolls[0].id;
+    await call('POST', `/api/jobs/${jobId}/optimize`);
+    // 布局 y=0 两件、y=400 两件；切线 400 裁下前两件
+    const cut = await call('POST', `/api/jobs/${jobId}/cuts`, { rollId: rid, cutLine: 400 });
+    assert.strictEqual(cut.status, 200);
+    const cutIds = new Set(cut.data.cut.newCutPieceIds);
+
+    // 改版 400→500 见方
+    const rv = await call('POST', `/api/jobs/${jobId}/piece-types/${tid}/revisions`, {
+      vertices: rect(0, 0, 500, 500), quantity: 4, allowRotate: true,
+    });
+    assert.strictEqual(rv.status, 200, JSON.stringify(rv.data));
+    assert.strictEqual(rv.data.revision.revision, 2);
+    assert.deepStrictEqual(rv.data.revision.cutPieceIdsKept.sort(), [...cutIds].sort());
+    for (const p of rv.data.placements) {
+      if (cutIds.has(p.id)) {
+        assert(p.cut && p.revision === 1 && p.bw === 400, '已裁件保留第 1 版轮廓');
+      } else {
+        assert.strictEqual(p.revision, 2, '未裁件改用第 2 版');
+        assert.strictEqual(p.bw, 500);
+      }
+    }
+    // y=400 的两件原位 (0,400)/(400,400) 在 500 宽下互相重叠：id 小者退回，大者保留
+    const unc = rv.data.placements.filter((p) => !cutIds.has(p.id)).sort((a, b) => a.id - b.id);
+    assert.strictEqual(unc[0].placed, false);
+    assert(/改版/.test(unc[0].reason) && /冲突/.test(unc[0].reason));
+    assert.strictEqual(unc[1].placed, true);
+    // 型号携带全部版次
+    assert.deepStrictEqual(rv.data.pieceTypes[0].revisions.map((r) => r.rev), [1, 2]);
+    // 卷占用按新轮廓重算（保留件 y=400+500=900），且仍包含切线前占用
+    const roll = rv.data.rolls.find((r) => r.id === rid);
+    assert.strictEqual(roll.usedLength, 900);
+    assert.strictEqual(rv.data.job.status, 'partial');
+  })
+);
+
+test('API：改版——缩减先删未排件，再按 id 降序删未锁定已排件，绝不删已裁/锁定件', () =>
+  withServer(async (call) => {
+    const cr = await call('POST', '/api/jobs', {
+      rolls: [{ label: 'A', width: 1000, length: 5000 }],
+      pieces: [{ name: '块', vertices: rect(0, 0, 400, 400), quantity: 4 }],
+    });
+    const jobId = cr.data.job.id;
+    const tid = cr.data.pieceTypes[0].id;
+    const rid = cr.data.rolls[0].id;
+    await call('POST', `/api/jobs/${jobId}/optimize`);
+    const all = (await call('GET', `/api/jobs/${jobId}`)).data.placements.sort((a, b) => a.id - b.id);
+    // 裁下 id 最小的两件；把第三件移回未排区
+    const [a, b, c, d] = all;
+    await call('POST', `/api/jobs/${jobId}/cuts`, { rollId: rid, cutLine: 400 });
+    assert.strictEqual((await call('POST', `/api/jobs/${jobId}/placements/${c.id}/unplace`)).status, 200);
+    // 4→2：已裁 2 件受保护，未排件 c 先删，已排未锁定 d 再删；留下恰为已裁两件
+    const rv = await call('POST', `/api/jobs/${jobId}/piece-types/${tid}/revisions`, {
+      vertices: rect(0, 0, 300, 300), quantity: 2,
+    });
+    assert.strictEqual(rv.status, 200, JSON.stringify(rv.data));
+    const left = rv.data.placements.map((p) => p.id).sort((x, y) => x - y);
+    assert.deepStrictEqual(left, [a.id, b.id].sort());
+    assert.deepStrictEqual(rv.data.revision.deletedPieceIds.sort(), [c.id, d.id].sort());
+  })
+);
+
+test('API：改版——目标件数少于已裁+锁定数 400；锁定件原位不满足新轮廓整次 409 且不变', () =>
+  withServer(async (call) => {
+    const cr = await call('POST', '/api/jobs', {
+      rolls: [{ label: 'A', width: 1000, length: 5000 }],
+      pieces: [{ name: '块', vertices: rect(0, 0, 400, 400), quantity: 4 }],
+    });
+    const jobId = cr.data.job.id;
+    const tid = cr.data.pieceTypes[0].id;
+    const rid = cr.data.rolls[0].id;
+    await call('POST', `/api/jobs/${jobId}/optimize`);
+    // 4 件 400 见方：y=0 两件、y=400 两件。切线 400 裁下第一行；锁第二行右侧件于 (400,400)
+    await call('POST', `/api/jobs/${jobId}/cuts`, { rollId: rid, cutLine: 400 });
+    const st = await call('GET', `/api/jobs/${jobId}`);
+    const lockedPiece = st.data.placements.find((p) => !p.cut && p.x === 400 && p.y === 400);
+    assert(lockedPiece, '应有一件未裁件位于 (400,400)');
+    await call('POST', `/api/jobs/${jobId}/placements/${lockedPiece.id}/lock`, { locked: true });
+    // 缩到 1：已裁 2 + 未裁锁定 1 = 3 不可删
+    let r = await call('POST', `/api/jobs/${jobId}/piece-types/${tid}/revisions`, {
+      vertices: rect(0, 0, 300, 300), quantity: 1,
+    });
+    assert.strictEqual(r.status, 400);
+    assert(/不可删除件数/.test(r.data.error));
+    // 新轮廓 700 宽，锁定件在 x=400 → 400+700>1000 越布边（但 700 宽本身放得进 1000 卷）：整次拒绝
+    r = await call('POST', `/api/jobs/${jobId}/piece-types/${tid}/revisions`, {
+      vertices: rect(0, 0, 700, 400), quantity: 4,
+    });
+    assert.strictEqual(r.status, 409, JSON.stringify(r.data));
+    assert(/锁定/.test(r.data.error));
+    assert(r.data.conflicts.some((s) => new RegExp(lockedPiece.name + '#').test(s) && /布边/.test(s)));
+    // 原方案不变
+    const q = await call('GET', `/api/jobs/${jobId}`);
+    const p = q.data.placements.find((x) => x.id === lockedPiece.id);
+    assert(p.placed && p.locked && p.x === 400 && p.revision === 1);
+    assert.strictEqual(q.data.pieceTypes[0].currentRev, 1);
+  })
+);
+
+test('API：改版——扩增件进入未排区、件号接最大号之后、无必用卷；原必用卷约束保留', () =>
+  withServer(async (call) => {
+    const cr = await call('POST', '/api/jobs', {
+      rolls: [{ label: 'A', width: 1000, length: 5000 }, { label: 'B', width: 800, length: 5000 }],
+      pieces: [{ name: '袖', vertices: rect(0, 0, 300, 300), quantity: 2, requiredRoll: 2 }],
+    });
+    const jobId = cr.data.job.id;
+    const tid = cr.data.pieceTypes[0].id;
+    const B = cr.data.rolls[1].id;
+    await call('POST', `/api/jobs/${jobId}/optimize`);
+    const rv = await call('POST', `/api/jobs/${jobId}/piece-types/${tid}/revisions`, {
+      vertices: rect(0, 0, 250, 250), quantity: 4, allowRotate: true,
+    });
+    assert.strictEqual(rv.status, 200, JSON.stringify(rv.data));
+    assert.strictEqual(rv.data.revision.addedCount, 2);
+    const news = rv.data.placements.filter((p) => p.seq >= 3).sort((a, b) => a.seq - b.seq);
+    assert.deepStrictEqual(news.map((p) => p.seq), [3, 4]);
+    assert(news.every((p) => !p.placed && p.requiredRollId === null && p.revision === 2));
+    // 原两件必用卷约束不变
+    assert(rv.data.placements.filter((p) => p.seq <= 2).every((p) => p.requiredRollId === B));
+  })
+);
+
+test('API：改版——任一剩余卷容不下新外接尺寸或必用卷容不下时 400 且方案不变', () =>
+  withServer(async (call) => {
+    const cr = await call('POST', '/api/jobs', {
+      rolls: [
+        { label: '宽', width: 1600, length: 5000 },
+        { label: '窄', width: 600, length: 5000 },
+      ],
+      pieces: [{ name: '袖', vertices: rect(0, 0, 300, 300), quantity: 1, requiredRoll: 2 }],
+    });
+    const jobId = cr.data.job.id;
+    const tid = cr.data.pieceTypes[0].id;
+    // 700 宽：宽卷容得下，但必用窄卷容不下 → 拒绝
+    let r = await call('POST', `/api/jobs/${jobId}/piece-types/${tid}/revisions`, {
+      vertices: rect(0, 0, 700, 300), quantity: 1,
+    });
+    assert.strictEqual(r.status, 400);
+    assert(/必用卷/.test(r.data.error));
+    // 2000 宽：所有卷都放不下 → 拒绝
+    r = await call('POST', `/api/jobs/${jobId}/piece-types/${tid}/revisions`, {
+      vertices: rect(0, 0, 2000, 300), quantity: 1,
+    });
+    assert.strictEqual(r.status, 400);
+    assert(/任何一卷/.test(r.data.error));
+    const q = await call('GET', `/api/jobs/${jobId}`);
+    assert.strictEqual(q.data.pieceTypes[0].currentRev, 1);
+  })
+);
+
+test('API：改版后再次修订针对当前纸样；锁定件原位合法时保留；优化后旧版已裁件仍固定', () =>
+  withServer(async (call) => {
+    const cr = await call('POST', '/api/jobs', {
+      rolls: [{ label: 'A', width: 1000, length: 6000 }],
+      pieces: [{ name: '块', vertices: rect(0, 0, 400, 400), quantity: 3, allowRotate: true }],
+    });
+    const jobId = cr.data.job.id;
+    const tid = cr.data.pieceTypes[0].id;
+    const rid = cr.data.rolls[0].id;
+    await call('POST', `/api/jobs/${jobId}/optimize`);
+    await call('POST', `/api/jobs/${jobId}/cuts`, { rollId: rid, cutLine: 400 }); // 裁下前两件
+    // 第一次改版为 300×300
+    let rv = await call('POST', `/api/jobs/${jobId}/piece-types/${tid}/revisions`, {
+      vertices: rect(0, 0, 300, 300), quantity: 3, allowRotate: false,
+    });
+    assert.strictEqual(rv.status, 200);
+    assert.strictEqual(rv.data.pieceTypes[0].currentRev, 2);
+    // 再次修订针对当前版 → 第 3 版
+    rv = await call('POST', `/api/jobs/${jobId}/piece-types/${tid}/revisions`, {
+      vertices: rect(0, 0, 250, 250), quantity: 3, allowRotate: true,
+    });
+    assert.strictEqual(rv.status, 200);
+    assert.strictEqual(rv.data.pieceTypes[0].currentRev, 3);
+    assert.deepStrictEqual(rv.data.pieceTypes[0].revisions.map((x) => x.rev), [1, 2, 3]);
+    assert(rv.data.placements.some((p) => p.cut && p.revision === 1), '已裁件始终第 1 版');
+    assert(rv.data.placements.some((p) => !p.cut && p.revision === 3), '未裁件到第 3 版');
+    // 优化后已裁旧版件保持原位原卷，全部未裁件可排齐
+    const op = await call('POST', `/api/jobs/${jobId}/optimize`);
+    assert.strictEqual(op.status, 200);
+    const cutPieces = op.data.placements.filter((p) => p.cut);
+    assert(cutPieces.every((p) => p.bw === 400 && p.rollId === rid && p.y < 400));
+  })
+);
+
+test('API：改版——锁定件与新轮廓、瑕疵/切线冲突的整次拒绝；退回件原因注明冲突对象', () =>
+  withServer(async (call) => {
+    const cr = await call('POST', '/api/jobs', {
+      rolls: [{ label: 'A', width: 1000, length: 5000, defects: [{ x: 0, y: 900, w: 300, h: 100 }] }],
+      pieces: [{ name: '块', vertices: rect(0, 0, 400, 400), quantity: 2 }],
+    });
+    const jobId = cr.data.job.id;
+    const tid = cr.data.pieceTypes[0].id;
+    await call('POST', `/api/jobs/${jobId}/optimize`);
+    const all = (await call('GET', `/api/jobs/${jobId}`)).data.placements.sort((a, b) => a.id - b.id);
+    // 把第一件锁到 (0,900)（瑕疵在 y900~1000 的 (0,0)-(300,100) 区，400 见方原位与瑕疵重叠）
+    // 先令瑕疵不影响 400 轮廓：瑕疵 (0,900,300x100) 与 (0,900) 的 400x400 重叠，故手动移动会被拒；
+    // 改为把锁定件放到不与旧轮廓冲突的 (0,500)，新轮廓改成高 450 → 与瑕疵 y900 重叠。
+    await call('POST', `/api/jobs/${jobId}/placements/${all[0].id}/move`, { rollId: cr.data.rolls[0].id, x: 0, y: 500, rotation: 0 });
+    await call('POST', `/api/jobs/${jobId}/placements/${all[0].id}/lock`, { locked: true });
+    const r = await call('POST', `/api/jobs/${jobId}/piece-types/${tid}/revisions`, {
+      vertices: rect(0, 0, 400, 450), quantity: 2, // (0,500)+450=950，伸入瑕疵区
+    });
+    assert.strictEqual(r.status, 409, JSON.stringify(r.data));
+    assert(/锁定裁片/.test(r.data.error));
+    assert(r.data.conflicts.some((s) => /瑕疵/.test(s)));
+    const q = await call('GET', `/api/jobs/${jobId}`);
+    const p = q.data.placements.find((x) => x.id === all[0].id);
+    assert(p.locked && p.y === 500 && p.revision === 1);
+  })
+);
+
 runAll().then(() => {
   console.log(`\n${passed} 项测试${process.exitCode ? '，存在失败' : '全部通过'}。`);
 });
