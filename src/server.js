@@ -6,6 +6,7 @@ const db = require('./db');
 const geom = require('./geom');
 const { optimizeRolls } = require('./nest');
 const { validateJobInput } = require('./validate');
+const { planRevision, UNPLACED_AFTER_REVISE } = require('./revise');
 
 const app = express();
 app.use(express.json({ limit: '2mb' }));
@@ -22,7 +23,8 @@ function loadFull(jobId) {
   const defects = db
     .prepare('SELECT id, roll_id, x, y, w, h FROM defects WHERE job_id = ? ORDER BY id')
     .all(jobId);
-  const types = db.prepare('SELECT * FROM piece_types WHERE job_id = ?').all(jobId);
+  const types = db.prepare('SELECT * FROM piece_types WHERE job_id = ? ORDER BY id').all(jobId);
+  const models = db.prepare('SELECT * FROM piece_models WHERE job_id = ? ORDER BY id').all(jobId);
   const placements = db
     .prepare(
       `SELECT p.*, t.name, t.allow_rotate, t.bw, t.bh
@@ -30,7 +32,7 @@ function loadFull(jobId) {
        WHERE p.job_id = ? ORDER BY p.id`
     )
     .all(jobId);
-  return { job, rolls, defects, types, placements };
+  return { job, rolls, defects, types, models, placements };
 }
 
 /**
@@ -72,7 +74,8 @@ function recompute(jobId, touch) {
 function jobState(jobId) {
   const full = loadFull(jobId);
   if (!full) return null;
-  const { job, rolls, defects, types, placements } = full;
+  const { job, rolls, defects, types, models, placements } = full;
+  const currentTypeByModel = new Map(models.map((m) => [m.id, m.current_type_id]));
   const cutCountByRoll = new Map(rolls.map((r) => [r.id, 0]));
   for (const p of placements) {
     if (p.placed && p.cut) cutCountByRoll.set(p.roll_id, (cutCountByRoll.get(p.roll_id) || 0) + 1);
@@ -111,8 +114,17 @@ function jobState(jobId) {
         .filter((d) => d.roll_id === r.id)
         .map((d) => ({ id: d.id, x: d.x, y: d.y, w: d.w, h: d.h })),
     })),
+    models: models.map((m) => ({
+      id: m.id,
+      name: m.name,
+      currentTypeId: m.current_type_id,
+    })),
     pieceTypes: types.map((t) => ({
       id: t.id,
+      modelId: t.model_id,
+      version: t.version,
+      current: currentTypeByModel.get(t.model_id) === t.id,
+      supersededById: t.superseded_by,
       name: t.name,
       vertices: JSON.parse(t.vertices),
       quantity: t.quantity,
@@ -122,6 +134,7 @@ function jobState(jobId) {
     })),
     placements: placements.map((p) => ({
       id: p.id,
+      modelId: p.model_id,
       pieceTypeId: p.piece_type_id,
       rollId: p.roll_id,
       requiredRollId: p.required_roll_id,
@@ -211,18 +224,23 @@ app.post('/api/jobs', (req, res) => {
     value.rolls.forEach((r, i) => {
       for (const d of r.defects) insD.run(jobId, rollIds[i], d.x, d.y, d.w, d.h);
     });
+    const insM = db.prepare(
+      'INSERT INTO piece_models (job_id, name, current_type_id) VALUES (?, ?, ?)'
+    );
     const insT = db.prepare(
-      'INSERT INTO piece_types (job_id, name, vertices, quantity, allow_rotate, bw, bh) VALUES (?, ?, ?, ?, ?, ?, ?)'
+      'INSERT INTO piece_types (job_id, model_id, version, superseded_by, name, vertices, quantity, allow_rotate, bw, bh) VALUES (?, ?, 1, NULL, ?, ?, ?, ?, ?, ?)'
     );
     const insP = db.prepare(
-      'INSERT INTO placements (job_id, piece_type_id, seq, required_roll_id) VALUES (?, ?, ?, ?)'
+      'INSERT INTO placements (job_id, model_id, piece_type_id, seq, required_roll_id) VALUES (?, ?, ?, ?, ?)'
     );
     for (const p of value.pieces) {
-      const t = insT.run(
-        jobId, p.name, JSON.stringify(p.vertices), p.quantity, p.allowRotate ? 1 : 0, p.bw, p.bh
-      );
+      const tInfo = insT.run(jobId, null, p.name, JSON.stringify(p.vertices), p.quantity, p.allowRotate ? 1 : 0, p.bw, p.bh);
+      const typeId = Number(tInfo.lastInsertRowid);
+      const mInfo = insM.run(jobId, p.name, typeId);
+      const modelId = Number(mInfo.lastInsertRowid);
+      db.prepare('UPDATE piece_types SET model_id = ? WHERE id = ?').run(modelId, typeId);
       const reqRollId = p.requiredRollIndex == null ? null : rollIds[p.requiredRollIndex];
-      for (let s = 1; s <= p.quantity; s++) insP.run(jobId, t.lastInsertRowid, s, reqRollId);
+      for (let s = 1; s <= p.quantity; s++) insP.run(jobId, modelId, typeId, s, reqRollId);
     }
     return jobId;
   });
@@ -579,6 +597,168 @@ app.post('/api/jobs/:id/placements/:pid/require-roll', (req, res) => {
   );
   res.json(jobState(jobId));
 });
+
+// ---------- 纸样改版（按型号修订轮廓/旋转/件数） ----------
+
+/**
+ * 针对型号当前纸样提交改版：
+ *   POST /api/jobs/:id/models/:modelId/revise
+ *   （别名：POST /api/jobs/:id/piece-types/:typeId/revise，:typeId 必须为该型号【当前】版本）
+ * body: { vertices:[[x,y],...], allowRotate?: bool, quantity: int }
+ *
+ * 成功返回完整方案状态并附 revision 摘要；任一校验失败返回 400/409 且原方案完全不变。
+ */
+function reviseHandler(req, res, idKey) {
+  const jobId = Number(req.params.id);
+  const full = loadFull(jobId);
+  if (!full) return res.status(404).json({ error: '方案不存在' });
+  const { rolls, defects, types, models, placements } = full;
+
+  // 解析型号与当前版本
+  let model;
+  if (idKey === 'modelId') {
+    const mid = Number(req.params.modelId);
+    model = models.find((m) => m.id === mid);
+    if (!model) {
+      return res.status(404).json({
+        error: `型号不存在：方案中没有 modelId=${req.params.modelId} 的型号（可用型号：${models
+          .map((m) => `${m.id}=${m.name}`)
+          .join('、')}）`,
+      });
+    }
+  } else {
+    const tid = Number(req.params.typeId);
+    const t = types.find((x) => x.id === tid);
+    if (!t) {
+      return res.status(404).json({ error: '纸样版本不存在' });
+    }
+    model = models.find((m) => m.id === t.model_id);
+    if (!model || model.current_type_id !== tid) {
+      const cur = model ? types.find((x) => x.id === model.current_type_id) : null;
+      return res.status(409).json({
+        error:
+          `纸样版本 #${tid} 已不是型号「${t.name}」的当前版本` +
+          (cur ? `（当前为版本 #${cur.id}）；后续修订须针对当前纸样，或改用型号 id 调用 /models/:modelId/revise` : '') +
+          '，原方案不变',
+      });
+    }
+  }
+  const currentType = types.find((t) => t.id === model.current_type_id);
+
+  // 规划（纯逻辑，不改库）
+  const typesById = new Map(
+    types.map((t) => [t.id, { id: t.id, name: t.name, verts: JSON.parse(t.vertices), bw: t.bw, bh: t.bh }])
+  );
+  const result = planRevision({
+    model: { id: model.id, name: model.name, currentTypeId: model.current_type_id },
+    currentType: {
+      id: currentType.id,
+      name: currentType.name,
+      verts: JSON.parse(currentType.vertices),
+      allowRotate: !!currentType.allow_rotate,
+      bw: currentType.bw,
+      bh: currentType.bh,
+    },
+    newSpec: req.body || {},
+    typesById,
+    placements: placements.map((p) => ({
+      id: p.id,
+      pieceTypeId: p.piece_type_id,
+      modelId: p.model_id,
+      rollId: p.roll_id,
+      requiredRollId: p.required_roll_id,
+      seq: p.seq,
+      x: p.x,
+      y: p.y,
+      rotation: p.rotation,
+      placed: p.placed,
+      locked: p.locked,
+      cut: p.cut,
+      name: p.name,
+    })),
+    rolls: rolls.map((r) => ({
+      id: r.id,
+      label: r.label,
+      width: r.width,
+      length: r.length,
+      cutLine: r.cut_line,
+      defects: defects.filter((d) => d.roll_id === r.id).map((d) => ({ id: d.id, x: d.x, y: d.y, w: d.w, h: d.h })),
+    })),
+  });
+
+  if (result.errors) {
+    return res.status(400).json({ error: '改版输入不合法，原方案不变', details: result.errors });
+  }
+  if (result.status) {
+    return res.status(result.status).json({ error: result.error, conflicts: result.conflicts || [] });
+  }
+
+  const { plan } = result;
+  const nt = plan.newType;
+  const tx = db.transaction(() => {
+    // 新版本纸样行
+    const newVersionNo = db
+      .prepare('SELECT COALESCE(MAX(version), 0) AS v FROM piece_types WHERE model_id = ?')
+      .get(model.id).v + 1;
+    const insT = db.prepare(
+      'INSERT INTO piece_types (job_id, model_id, version, superseded_by, name, vertices, quantity, allow_rotate, bw, bh) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)'
+    );
+    const info = insT.run(
+      jobId, model.id, newVersionNo, nt.name, JSON.stringify(nt.verts), plan.counts.target,
+      nt.allowRotate ? 1 : 0, nt.bw, nt.bh
+    );
+    const newTypeId = Number(info.lastInsertRowid);
+    db.prepare('UPDATE piece_types SET superseded_by = ? WHERE id = ?').run(newTypeId, currentType.id);
+    db.prepare('UPDATE piece_models SET current_type_id = ? WHERE id = ?').run(newTypeId, model.id);
+
+    // 删除件（仅未裁、未锁定；规划阶段已保证）
+    const del = db.prepare('DELETE FROM placements WHERE id = ? AND job_id = ? AND cut = 0 AND locked = 0');
+    for (const id of plan.deleteIds) del.run(id, jobId);
+
+    // 未裁保留件改用新版本；失效的未锁定件退回未排区
+    const repointPlaced = db.prepare(
+      'UPDATE placements SET piece_type_id = ? WHERE id = ? AND job_id = ?'
+    );
+    const repointUnplace = db.prepare(
+      'UPDATE placements SET piece_type_id = ?, roll_id = NULL, x = NULL, y = NULL, rotation = 0, placed = 0, unplaced_reason = ? WHERE id = ? AND job_id = ?'
+    );
+    const bouncedSet = new Set(plan.bounced.map((b) => b.id));
+    const reasonById = new Map(plan.bounced.map((b) => [b.id, b.reason]));
+    for (const id of plan.repointIds) {
+      if (bouncedSet.has(id)) repointUnplace.run(newTypeId, reasonById.get(id), id, jobId);
+      else repointPlaced.run(newTypeId, id, jobId);
+    }
+
+    // 扩增新件：未排、无必用卷
+    const insP = db.prepare(
+      'INSERT INTO placements (job_id, model_id, piece_type_id, seq, placed, locked, cut, unplaced_reason) VALUES (?, ?, ?, ?, 0, 0, 0, ?)'
+    );
+    for (const np of plan.newPieces) {
+      insP.run(jobId, model.id, newTypeId, np.seq, UNPLACED_AFTER_REVISE);
+    }
+
+    recompute(jobId);
+  });
+  tx();
+
+  const state = jobState(jobId);
+  state.revision = {
+    modelId: model.id,
+    name: plan.name,
+    newTypeId: state.pieceTypes.find(
+      (t) => t.modelId === model.id && t.id !== currentType.id && t.current
+    )?.id,
+    version: state.pieceTypes.find((t) => t.modelId === model.id && t.current)?.version,
+    deletedPieceIds: plan.deleteIds,
+    bounced: plan.bounced,
+    newPieceCount: plan.newPieces.length,
+    counts: plan.counts,
+  };
+  res.json(state);
+}
+
+app.post('/api/jobs/:id/models/:modelId/revise', (req, res) => reviseHandler(req, res, 'modelId'));
+app.post('/api/jobs/:id/piece-types/:typeId/revise', (req, res) => reviseHandler(req, res, 'typeId'));
 
 // ---------- 裁剪进度（按卷逐段，不可回退） ----------
 
